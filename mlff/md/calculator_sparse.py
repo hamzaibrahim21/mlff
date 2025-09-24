@@ -88,8 +88,19 @@ class mlffCalculatorSparse(Calculator):
             dtype: np.dtype = np.float64,
             model: str = 'so3krates',
             has_aux: bool = False,
-            from_file: bool = False
+            from_file: bool = False,
+            output_per_atom_energy_components: bool = False
     ):
+
+        # Configure output intermediate quantities if requested
+        output_intermediate_quantities = None
+        if output_per_atom_energy_components:
+            output_intermediate_quantities = [
+                'mlff_atomic_energy',
+                'zbl_repulsion',
+                'electrostatic_energy',
+                'dispersion_energy'
+            ]
 
         mlff_potential = MLFFPotentialSparse.create_from_ckpt_dir(
             ckpt_dir=ckpt_dir,
@@ -101,7 +112,8 @@ class mlffCalculatorSparse(Calculator):
             ),
             dtype=dtype,
             model=model,
-            from_file=from_file
+            from_file=from_file,
+            output_intermediate_quantities=output_intermediate_quantities
         )
 
         return cls(potential=mlff_potential,
@@ -112,7 +124,8 @@ class mlffCalculatorSparse(Calculator):
                    lr_neighbors_bool=lr_neighbors_bool,
                    lr_cutoff=lr_cutoff,
                    dtype=dtype,
-                   has_aux=has_aux
+                   has_aux=has_aux,
+                   output_per_atom_energy_components=output_per_atom_energy_components
                    )
 
     def __init__(
@@ -124,6 +137,7 @@ class mlffCalculatorSparse(Calculator):
             calculate_stress: bool,
             dtype: np.dtype,
             has_aux: bool,
+            output_per_atom_energy_components: bool = False,
             *args,
             **kwargs
     ):
@@ -210,6 +224,7 @@ class mlffCalculatorSparse(Calculator):
                     return {'energy': out, 'forces': forces}
 
         self.calculate_fn = calculate_fn
+        self.potential = potential  # Store potential for per-atom component extraction
         self.neighbors = None
         self.spatial_partitioning = None
         self.capacity_multiplier = capacity_multiplier
@@ -252,6 +267,8 @@ class mlffCalculatorSparse(Calculator):
                 self.lr_cutoff = potential.long_range_cutoff
 
         self.dtype = dtype
+        self.output_per_atom_energy_components = output_per_atom_energy_components
+        self.per_atom_energy_components = None  # Will store per-atom components
 
     def calculate(self, atoms=None, *args, **kwargs):
         super(mlffCalculatorSparse, self).calculate(atoms, *args, **kwargs)
@@ -307,6 +324,50 @@ class mlffCalculatorSparse(Calculator):
 
         output = self.calculate_fn(system, neighbors)  # note different cell convention
         self.results = jax.tree_map(lambda x: np.array(x, self.dtype), output)
+
+        # If per-atom energy components are requested, calculate them
+        if self.output_per_atom_energy_components:
+            self._calculate_per_atom_components(system, neighbors)
+
+    def _calculate_per_atom_components(self, system, neighbors):
+        """Calculate per-atom energy components"""
+        from glp.graph import system_to_graph
+        graph = system_to_graph(system, neighbors, pme=False)
+
+        # Get the full potential output with auxiliary information (has_aux=True)
+        energy, aux_output = self.potential(graph, has_aux=True)
+
+        # If aux_output is a dictionary with intermediate quantities, extract them
+        if isinstance(aux_output, dict):
+            self.per_atom_energy_components = {}
+            for component in ['mlff_atomic_energy', 'zbl_repulsion', 'electrostatic_energy', 'dispersion_energy']:
+                if component in aux_output:
+                    self.per_atom_energy_components[component] = np.array(aux_output[component], dtype=self.dtype)
+                    # print(f"DEBUG: Found {component} with shape {aux_output[component].shape}")
+                else:
+                    # Return zero vector if component not present
+                    num_atoms = len(system.atomic_numbers)
+                    self.per_atom_energy_components[component] = np.zeros(num_atoms, dtype=self.dtype)
+                    # print(f"DEBUG: {component} not found, using zeros with shape ({num_atoms},)")
+        else:
+            # Fallback: return None if intermediate quantities are not available
+            print("DEBUG: aux_output is not a dictionary, per-atom components not available")
+            self.per_atom_energy_components = None
+
+    def get_per_atom_energy_components(self):
+        """
+        Get per-atom energy components.
+
+        Returns:
+            dict: Dictionary with keys 'mlff_atomic_energy', 'zbl_repulsion',
+                  'electrostatic_energy', 'dispersion_energy', each containing
+                  a numpy array of per-atom energy contributions.
+                  Returns None if components were not calculated.
+        """
+        if not self.output_per_atom_energy_components:
+            raise ValueError("Per-atom energy components were not enabled. Set output_per_atom_energy_components=True when creating the calculator.")
+
+        return self.per_atom_energy_components
 
 
 def to_displacement(cell):

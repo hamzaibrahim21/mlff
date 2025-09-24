@@ -114,19 +114,34 @@ class EnergySparse(BaseSubModule):
 
         atomic_energy = safe_scale(atomic_energy, node_mask)
 
+        # Store the base MLFF atomic energy for intermediate quantities
+        mlff_atomic_energy = atomic_energy.copy()
+
         if self.zbl_repulsion_bool:
             inputs.update(**self.zbl_repulsion(inputs))
             atomic_energy += inputs['zbl_repulsion']
+        else:
+            # Store zero for disabled components if intermediate quantities are needed
+            inputs['zbl_repulsion'] = jnp.zeros_like(atomic_energy)
 
         if self.electrostatic_energy_bool:
             inputs.update(**self.partial_charges(inputs))
             inputs.update(**self.electrostatic_energy(inputs))
             atomic_energy += inputs['electrostatic_energy']
+        else:
+            # Store zero for disabled components if intermediate quantities are needed
+            inputs['electrostatic_energy'] = jnp.zeros_like(atomic_energy)
 
         if self.dispersion_energy_bool:
             inputs.update(**self.hirshfeld_ratios(inputs))
             inputs.update(**self.dispersion_energy(inputs))
             atomic_energy += inputs['dispersion_energy']
+        else:
+            # Store zero for disabled components if intermediate quantities are needed
+            inputs['dispersion_energy'] = jnp.zeros_like(atomic_energy)
+
+        # Store the MLFF component for intermediate quantities
+        inputs['mlff_atomic_energy'] = mlff_atomic_energy
 
         if self.output_convention == 'per_structure':
             energy = segment_sum(
@@ -165,10 +180,20 @@ class EnergySparse(BaseSubModule):
             # Skip the intermediate quantities that are already defined as observables
             if imq_key in ['dipole_vec', 'energy', 'hirshfeld_ratios']:
                 continue
-            imq = inputs.get(imq_key)
-            if imq is None:
-                raise ValueError(f"The requested intermediate quantity {imq_key} could not be generated.")
-            intermediate_quantities.update({imq_key:imq})
+
+            # Handle per-atom energy components
+            if imq_key in ['mlff_atomic_energy', 'zbl_repulsion', 'electrostatic_energy', 'dispersion_energy']:
+                imq = inputs.get(imq_key)
+                if imq is None:
+                    # This shouldn't happen now since we store all components
+                    raise ValueError(f"The requested intermediate quantity {imq_key} could not be generated.")
+                intermediate_quantities.update({imq_key: imq})
+            else:
+                # Handle other intermediate quantities as before
+                imq = inputs.get(imq_key)
+                if imq is None:
+                    raise ValueError(f"The requested intermediate quantity {imq_key} could not be generated.")
+                intermediate_quantities.update({imq_key: imq})
 
         return intermediate_quantities
 
