@@ -150,7 +150,7 @@ class mlffCalculatorSparse(Calculator):
         if calculate_stress:
             def energy_fn(system, strain: jnp.ndarray, neighbors):
                 system = strain_system(system, strain)
-                graph = system_to_graph(system, neighbors, pme=False)
+                graph = system_to_graph(system, neighbors)
 
                 out = potential(graph, has_aux=has_aux)
                 if isinstance(out, tuple):
@@ -190,7 +190,7 @@ class mlffCalculatorSparse(Calculator):
 
         else:
             def energy_fn(system, neighbors):
-                graph = system_to_graph(system, neighbors, pme=False)
+                graph = system_to_graph(system, neighbors)
                 out = potential(graph, has_aux=has_aux)
                 if isinstance(out, tuple):
                     if not has_aux:
@@ -332,7 +332,7 @@ class mlffCalculatorSparse(Calculator):
     def _calculate_per_atom_components(self, system, neighbors):
         """Calculate per-atom energy components"""
         from glp.graph import system_to_graph
-        graph = system_to_graph(system, neighbors, pme=False)
+        graph = system_to_graph(system, neighbors)
 
         # Get the full potential output with auxiliary information (has_aux=True)
         energy, aux_output = self.potential(graph, has_aux=True)
