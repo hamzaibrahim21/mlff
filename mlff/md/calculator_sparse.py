@@ -93,12 +93,29 @@ class mlffCalculatorSparse(Calculator):
             observables: Optional[Sequence[str]] = None,
             output_atom_indices: Optional[Sequence[int]] = None,
             hessian_slice: bool = False,
+            output_per_atom_energy_components: bool = False,
             **kwargs
     ):
         if observables is not None and len(observables) > 0:
             output_intermediate_quantities = [o.replace('_grad','').replace('_jac','') for o in (observables)]
         else:
             output_intermediate_quantities = None
+
+        # For per-atom energy decomposition (EDA) we request the base MLFF energy
+        # ('nn_energy') plus each additive energy component as intermediate quantities.
+        if output_per_atom_energy_components:
+            per_atom_energy_components = [
+                'nn_energy',
+                'zbl_repulsion',
+                'electrostatic_energy',
+                'dispersion_energy',
+            ]
+            if output_intermediate_quantities is None:
+                output_intermediate_quantities = list(per_atom_energy_components)
+            else:
+                output_intermediate_quantities = list(output_intermediate_quantities) + [
+                    q for q in per_atom_energy_components if q not in output_intermediate_quantities
+                ]
 
         mlff_potential = MLFFPotentialSparse.create_from_ckpt_dir(
             ckpt_dir=ckpt_dir,
@@ -127,7 +144,8 @@ class mlffCalculatorSparse(Calculator):
                    has_aux=has_aux,
                    observables=observables,
                    output_atom_indices=output_atom_indices,
-                   hessian_slice=hessian_slice
+                   hessian_slice=hessian_slice,
+                   output_per_atom_energy_components=output_per_atom_energy_components
                    )
 
     def __init__(
@@ -143,6 +161,7 @@ class mlffCalculatorSparse(Calculator):
             observables: Optional[Sequence[str]] = None,
             output_atom_indices: Optional[Sequence[int]] = None,
             hessian_slice: bool = False,
+            output_per_atom_energy_components: bool = False,
             *args,
             **kwargs
     ):
@@ -593,6 +612,11 @@ class mlffCalculatorSparse(Calculator):
 
         self.dtype = dtype
 
+        # Per-atom energy decomposition (EDA).
+        self.potential = potential  # stored for per-atom component extraction
+        self.output_per_atom_energy_components = output_per_atom_energy_components
+        self.per_atom_energy_components = None  # populated during calculate()
+
     def calculate(self, atoms=None, hessian_slice_index=None, *args, **kwargs):
         super(mlffCalculatorSparse, self).calculate(atoms, *args, **kwargs)
 
@@ -650,6 +674,53 @@ class mlffCalculatorSparse(Calculator):
         else:
             output = self.calculate_fn(system, neighbors)
         self.results = jax.tree_util.tree_map(lambda x: np.array(x, self.dtype), output)
+
+        # If per-atom energy components are requested, calculate them.
+        if self.output_per_atom_energy_components:
+            self._calculate_per_atom_components(system, neighbors)
+
+    def _calculate_per_atom_components(self, system, neighbors):
+        """Calculate per-atom energy components for EDA."""
+        from glp.graph import system_to_graph
+        graph = system_to_graph(system, neighbors)
+
+        # Get the full potential output with auxiliary information (has_aux=True).
+        _, aux_output = self.potential(graph, has_aux=True)
+
+        components = ['nn_energy', 'zbl_repulsion', 'electrostatic_energy', 'dispersion_energy']
+        if isinstance(aux_output, dict):
+            self.per_atom_energy_components = {}
+            num_atoms = len(system.atomic_numbers)
+            for component in components:
+                if component in aux_output:
+                    self.per_atom_energy_components[component] = np.array(
+                        aux_output[component], dtype=self.dtype
+                    ).reshape(-1)
+                else:
+                    # Return a zero vector if the component is not present.
+                    self.per_atom_energy_components[component] = np.zeros(num_atoms, dtype=self.dtype)
+        else:
+            # Fallback: intermediate quantities are not available.
+            self.per_atom_energy_components = None
+
+    def get_per_atom_energy_components(self):
+        """
+        Get per-atom energy components.
+
+        Returns:
+            dict: Dictionary with keys 'nn_energy', 'zbl_repulsion',
+                  'electrostatic_energy', 'dispersion_energy', each containing
+                  a numpy array of per-atom energy contributions (one value per atom,
+                  in the same order as the input `atoms`). Returns None if the
+                  components could not be calculated.
+        """
+        if not self.output_per_atom_energy_components:
+            raise ValueError(
+                "Per-atom energy components were not enabled. Set "
+                "output_per_atom_energy_components=True when creating the calculator."
+            )
+
+        return self.per_atom_energy_components
 
 
 def to_displacement(cell):

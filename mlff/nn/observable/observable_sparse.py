@@ -139,11 +139,15 @@ class EnergySparse(BaseSubModule):
         ).sum(axis=-1)  # (num_nodes)
 
         atomic_energy = safe_scale(atomic_energy, node_mask)
+        # Base MLFF atomic energy stored as 'nn_energy'; reused for per-atom EDA.
         inputs.update({'nn_energy': atomic_energy})
 
         if self.zbl_repulsion_bool:
             inputs.update(**self.zbl_repulsion(inputs))
             atomic_energy += inputs['zbl_repulsion']
+        else:
+            # Store zeros so a disabled component can still be requested for EDA.
+            inputs['zbl_repulsion'] = jnp.zeros_like(atomic_energy)
 
         if self.electrostatic_energy_bool:
             inputs.update(**self.partial_charges(inputs))
@@ -155,6 +159,9 @@ class EnergySparse(BaseSubModule):
             if inputs.get('k_smearing', None) is not None:
                 inputs.update(**self.electrostatic_energy_kspace(inputs))
                 atomic_energy += inputs['electrostatic_energy_kspace']
+        else:
+            # Store zeros so a disabled component can still be requested for EDA.
+            inputs['electrostatic_energy'] = jnp.zeros_like(atomic_energy)
 
         if self.dispersion_energy_bool:
             inputs.update(**self.hirshfeld_ratios(inputs))
@@ -163,6 +170,9 @@ class EnergySparse(BaseSubModule):
             del inputs['no_sigma']
             inputs.update(**self.dispersion_energy(inputs))
             atomic_energy += inputs['dispersion_energy']
+        else:
+            # Store zeros so a disabled component can still be requested for EDA.
+            inputs['dispersion_energy'] = jnp.zeros_like(atomic_energy)
 
         if self.output_convention == 'per_structure':
             energy = segment_sum(
