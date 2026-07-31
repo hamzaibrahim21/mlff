@@ -400,10 +400,14 @@ class PartialChargesSparse(BaseSubModule):
             # Residue-based charge conservation
             residue_charge = jnp.asarray(residue_charge, dtype=jnp.float32)
             residue_segments = jnp.pad(
-                jnp.asarray(inputs['residue_segments'], dtype=jnp.int32).at[-1].set(2),
+                jnp.asarray(inputs['residue_segments'], dtype=jnp.int32),
                 (0, num_nodes - len(inputs['residue_segments'])),
                 constant_values=2
             )
+            # Padding nodes are identified by node_mask, not by position: marking the
+            # last element only works for a batched graph, which always ends in a
+            # padding node. An unbatched graph has none, so it would drop a real atom.
+            residue_segments = jnp.where(node_mask, residue_segments, 2)
             batch_segments, total_charge, num_graphs = residue_segments, residue_charge, residue_charge.shape[0]
         
         # Unified charge conservation calculation
