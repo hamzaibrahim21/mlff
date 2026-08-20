@@ -12,7 +12,7 @@ from typing import Optional
 
 from mlff.nn.base.sub_module import BaseSubModule
 from mlff.masking.mask import safe_mask
-from mlff.nn.observable.dispersion_ref_data import alphas, C6_coef
+from mlff.nn.observable.dispersion_ref_data import alphas, C6_coef, alphas_legacy, C6_coef_legacy, NLH_AA, NLH_BB
 from mlff.masking.mask import safe_scale
 from mlff.nn.activation_function.activation_function import softplus_inverse, softplus
 
@@ -238,6 +238,7 @@ class HirshfeldSparse(BaseSubModule):
     activation_fn: Callable[[Any], Any] = lambda u: u
     output_is_zero_at_init: bool = True
     module_name = 'hirshfeld_ratios'
+    legacy: bool = False  # Use the original vanilla-SO3LR attention head architecture.
 
     def setup(self):
         if self.output_is_zero_at_init:
@@ -306,10 +307,43 @@ class HirshfeldSparse(BaseSubModule):
         # hirshfeld_ratios = jnp.abs(v_eff) # (num_nodes)
         # hirshfeld_ratios = safe_scale(hirshfeld_ratios, node_mask)
 
-        num_features = x.shape[-1]
+        if self.legacy:
+            # Original vanilla-SO3LR head: attention-like mechanism with
+            # element-dependent query/shift embeddings. Matches the parameter
+            # shapes of the legacy checkpoint (Embed_0 (.,1), Embed_1 (.,F/2),
+            # dense_final (.,F/2)).
+            num_features = x.shape[-1]
 
-        v_shift = nn.Embed(num_embeddings=100, features=1)(atomic_numbers).squeeze(axis=-1)  # shape: (num_nodes)
-        q = nn.Embed(num_embeddings=100, features=int(num_features / 2))(atomic_numbers)  # shape: (n,F/2)
+            v_shift = nn.Embed(num_embeddings=100, features=1)(atomic_numbers).squeeze(axis=-1)  # shape: (num_nodes)
+            q = nn.Embed(num_embeddings=100, features=int(num_features / 2))(atomic_numbers)  # shape: (n,F/2)
+
+            if self.regression_dim is not None:
+                y = nn.Dense(
+                    int(self.regression_dim / 2),
+                    kernel_init=nn.initializers.lecun_normal(),
+                    name='hirshfeld_ratios_dense_regression'
+                )(x)  # (num_nodes, regression_dim)
+                y = self.activation_fn(y)  # (num_nodes, regression_dim)
+                k = nn.Dense(
+                    int(num_features / 2),
+                    kernel_init=self.kernel_init,
+                    name='hirshfeld_ratios_dense_final'
+                )(y)  # (num_nodes)
+            else:
+                k = nn.Dense(
+                    int(num_features / 2),
+                    kernel_init=self.kernel_init,
+                    name='hirshfeld_ratios_dense_final'
+                )(x)  # (num_nodes)
+
+            qk = (q * k / jnp.sqrt(k.shape[-1])).sum(axis=-1)
+
+            v_eff = v_shift + qk  # shape: (n)
+            hirshfeld_ratios = safe_scale(jnp.abs(v_eff), node_mask)
+
+            return dict(hirshfeld_ratios=hirshfeld_ratios)
+
+        q = nn.Embed(num_embeddings=100, features=1)(atomic_numbers).squeeze(axis=-1)
 
         if self.regression_dim is not None:
             y = nn.Dense(
@@ -318,24 +352,84 @@ class HirshfeldSparse(BaseSubModule):
                 name='hirshfeld_ratios_dense_regression'
             )(x)  # (num_nodes, regression_dim)
             y = self.activation_fn(y)  # (num_nodes, regression_dim)
-            k = nn.Dense(
-                int(num_features / 2),
+            x_ = nn.Dense(
+                1,
                 kernel_init=self.kernel_init,
                 name='hirshfeld_ratios_dense_final'
-            )(y)  # (num_nodes)
+            )(y).squeeze(axis=-1)  # (num_nodes)
         else:
-            k = nn.Dense(
-                int(num_features / 2),
+            x_ = nn.Dense(
+                1,
                 kernel_init=self.kernel_init,
                 name='hirshfeld_ratios_dense_final'
-            )(x)  # (num_nodes)
+            )(x).squeeze(axis=-1)  # (num_nodes)
 
-        qk = (q * k / jnp.sqrt(k.shape[-1])).sum(axis=-1)
+        a0_ratios = safe_scale(jnp.abs(x_ + q), node_mask)
 
-        v_eff = v_shift + qk  # shape: (n)
-        hirshfeld_ratios = safe_scale(jnp.abs(v_eff), node_mask)
+        # New models predict static-polarizability (alpha_0) ratios; surface them
+        # under 'a0_ratios'. The legacy branch (above) keeps 'hirshfeld_ratios'.
+        return dict(a0_ratios=a0_ratios)
 
-        return dict(hirshfeld_ratios=hirshfeld_ratios)
+    def reset_output_convention(self, output_convention):
+        self.output_convention = output_convention
+
+
+class C6RatiosSparse(BaseSubModule):
+    prop_keys: Dict
+    regression_dim: int = None
+    activation_fn: Callable[[Any], Any] = lambda u: u
+    output_is_zero_at_init: bool = True
+    module_name = 'c6_ratios'
+
+    def setup(self):
+        if self.output_is_zero_at_init:
+            self.kernel_init = nn.initializers.zeros_init()
+        else:
+            self.kernel_init = nn.initializers.lecun_normal()
+
+    @nn.compact
+    def __call__(self,
+                 inputs: Dict,
+                 *args,
+                 **kwargs) -> Dict[str, jnp.ndarray]:
+        """Predict per-atom C6 volume ratios from atom-wise features and atomic types.
+
+        Args:
+            inputs (Dict):
+                x (Array): Atomic features, shape: (num_nodes, num_features)
+                atomic_numbers (Array): Atomic types, shape: (num_nodes)
+                node_mask (Array): Node mask, (num_nodes)
+
+        Returns:
+            Dict: ``{'c6_ratios': Array}`` with predicted C6 ratios, shape: (num_nodes).
+        """
+        x = inputs['x']  # (num_nodes, num_features)
+        atomic_numbers = inputs['atomic_numbers']  # (num_nodes)
+        node_mask = inputs['node_mask']  # (num_nodes)
+        q = nn.Embed(num_embeddings=100, features=1)(atomic_numbers).squeeze(axis=-1)
+
+        if self.regression_dim is not None:
+            y = nn.Dense(
+                int(self.regression_dim / 2),
+                kernel_init=nn.initializers.lecun_normal(),
+                name='c6_ratios_dense_regression'
+            )(x)  # (num_nodes, regression_dim)
+            y = self.activation_fn(y)  # (num_nodes, regression_dim)
+            x_ = nn.Dense(
+                1,
+                kernel_init=self.kernel_init,
+                name='c6_ratios_dense_final'
+            )(y).squeeze(axis=-1)  # (num_nodes)
+        else:
+            x_ = nn.Dense(
+                1,
+                kernel_init=self.kernel_init,
+                name='c6_ratios_dense_final'
+            )(x).squeeze(axis=-1)  # (num_nodes)
+
+        c6_ratios = safe_scale(jnp.abs(x_ + q), node_mask)
+
+        return dict(c6_ratios=c6_ratios)
 
     def reset_output_convention(self, output_convention):
         self.output_convention = output_convention
@@ -543,24 +637,40 @@ def vdw_QDO_disp_damp_nosigma(
 
     return c * V3 * jnp.asarray(Hartree, dtype=input_dtype)
 
-@jax.jit
+@partial(jax.jit, static_argnames=('legacy',))
 def mixing_rules(
         atomic_numbers: jnp.ndarray,
         idx_i: jnp.ndarray,
         idx_j: jnp.ndarray,
         hirshfeld_ratios: jnp.ndarray,
+        c6_ratios: jnp.ndarray,
+        legacy: bool = False,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Apply Casimir-Polder mixing rules to obtain pairwise dispersion parameters.
+
+    Args:
+        legacy: If True, use the legacy SO3LR (v1) free-atom reference
+            coefficients (``alphas_legacy``/``C6_coef_legacy``) instead of the
+            refitted ones used by the so3lr-s/m/l models.
+    """
     dtype = hirshfeld_ratios.dtype
+
+    # Free-atom reference coefficients: legacy v1 vs refitted (so3lr-s/m/l).
+    alphas_ref = alphas_legacy if legacy else alphas
+    C6_ref = C6_coef_legacy if legacy else C6_coef
 
     atomic_number_i = atomic_numbers[idx_i] - 1
     atomic_number_j = atomic_numbers[idx_j] - 1
     hirshfeld_ratio_i = hirshfeld_ratios[idx_i]
     hirshfeld_ratio_j = hirshfeld_ratios[idx_j]
 
-    alpha_i = jnp.asarray(jnp.take(alphas, atomic_number_i, axis=0), dtype=dtype) * hirshfeld_ratio_i
-    C6_i = jnp.asarray(jnp.take(C6_coef, atomic_number_i, axis=0), dtype=dtype) * jnp.square(hirshfeld_ratio_i)
-    alpha_j = jnp.asarray(jnp.take(alphas, atomic_number_j, axis=0), dtype=dtype) * hirshfeld_ratio_j
-    C6_j = jnp.asarray(jnp.take(C6_coef, atomic_number_j, axis=0), dtype=dtype) * jnp.square(hirshfeld_ratio_j)
+    C6_ratio_i = c6_ratios[idx_i]
+    C6_ratio_j = c6_ratios[idx_j]
+
+    alpha_i = jnp.asarray(jnp.take(alphas_ref, atomic_number_i, axis=0), dtype=dtype) * hirshfeld_ratio_i
+    C6_i = jnp.asarray(jnp.take(C6_ref, atomic_number_i, axis=0), dtype=dtype) * C6_ratio_i
+    alpha_j = jnp.asarray(jnp.take(alphas_ref, atomic_number_j, axis=0), dtype=dtype) * hirshfeld_ratio_j
+    C6_j = jnp.asarray(jnp.take(C6_ref, atomic_number_j, axis=0), dtype=dtype) * C6_ratio_j
 
     alpha_ij = (alpha_i + alpha_j) / 2
     C6_ij = 2 * C6_i * C6_j * alpha_j * alpha_i / (alpha_i ** 2 * C6_j + alpha_j ** 2 * C6_i)
@@ -896,6 +1006,73 @@ class ZBLRepulsionSparse(BaseSubModule):
         pass
 
 
+class NLHRepulsionSparse(BaseSubModule):
+    """
+    NLH repulsion (used by the newer so3lr-s/m/l models).
+    """
+    prop_keys: Dict
+    module_name: str = 'zbl_repulsion'
+    a0: float = 0.5291772105638411
+    ke: float = 14.399645351950548
+
+    @nn.compact
+    def __call__(self, inputs: Dict, *args, **kwargs) -> Dict[str, jnp.ndarray]:
+        atomic_numbers = inputs['atomic_numbers']
+        node_mask = inputs['node_mask']
+        phi_r_cut_ij = inputs['cut']
+        idx_i = inputs['idx_i']
+        idx_j = inputs['idx_j']
+        d_ij = inputs['d_ij']
+        dtype = d_ij.dtype
+
+        num_nodes = len(node_mask)
+
+        # Gather atomic numbers per edge, start from 0 so -1
+        z_i = atomic_numbers[idx_i] - 1
+        z_j = atomic_numbers[idx_j] - 1
+
+        # Symmetrize for table lookup so we always hit the filled triangle
+        zi = jnp.minimum(z_i, z_j)                       # (E,)
+        zj = jnp.maximum(z_i, z_j)                       # (E,)
+
+        # Get NLH coefficients
+        # First gather along Z_i (axis 0), then along Z_j (axis 1)
+        a = jnp.asarray(jnp.take(NLH_AA, zi, axis=0), dtype=dtype)   # (E, 93, 3)
+        a = jnp.take_along_axis(a, zj[:, None, None], axis=1)     # (E, 1, 3)
+        a = a.squeeze(1)                                           # (E, 3)
+
+        b = jnp.asarray(jnp.take(NLH_BB, zi, axis=0), dtype=dtype)   # (E, 93, 3)
+        b = jnp.take_along_axis(b, zj[:, None, None], axis=1)     # (E, 1, 3)
+        b = b.squeeze(1)                                           # (E, 3)
+
+        # Coulomb factor ke * Z_i * Z_j / r (dtype-safe)
+        z_over_r = safe_mask(
+            mask=(d_ij != 0),
+            operand=d_ij,
+            fn=lambda u: (z_i + 1) * (z_j + 1) / u,
+            placeholder=0.0
+        )
+        x = self.ke * phi_r_cut_ij * z_over_r
+
+        # NLH screening phi(r)
+        y = jnp.sum(a * jnp.exp(-b * d_ij[:, None]), axis=-1)
+
+        # Switching, edge energy, and reduction
+        w = switching_fn(d_ij, x_on=0.0, x_off=1.5)
+
+        e_rep_edge = w * x * y / jnp.asarray(2, dtype=d_ij.dtype)
+        e_rep_edge = segment_sum(e_rep_edge, segment_ids=idx_i, num_segments=num_nodes)
+        e_rep_edge = safe_scale(e_rep_edge, node_mask)
+
+        # Expose under both keys: 'zbl_repulsion' keeps the energy-summation /
+        # checkpoint path working (shared module_name), 'nlh_repulsion' is the
+        # clear name for this model's repulsion, requestable as an observable.
+        return dict(zbl_repulsion=e_rep_edge, nlh_repulsion=e_rep_edge)
+
+    def reset_output_convention(self, output_convention):
+        pass
+
+
 class ElectrostaticEnergySparse(BaseSubModule):
     prop_keys: Dict
     partial_charges: Any
@@ -1078,7 +1255,9 @@ class DispersionEnergySparse(nn.Module):
     cutoff_lr: float
     cutoff_lr_damping: float
     hirshfeld_ratios: Optional[Any]
+    c6_ratios: Optional[Any] = None
     dispersion_energy_scale: float = 1.0
+    legacy: bool = False  # Legacy SO3LR: derive C6 from Hirshfeld ratios (no c6 head).
 
     neighborlist_format: str = 'sparse'  # or 'ordered_sparse'
     module_name = 'dispersion_energy'
@@ -1095,10 +1274,22 @@ class DispersionEnergySparse(nn.Module):
         # Determine input dtype
         input_dtype = d_ij_lr.dtype
 
-        # Calculate Hirshfeld ratios
-        hirshfeld_ratios = inputs.get('hirshfeld_ratios')
+        # Polarizability/volume ratios used for alpha scaling. The head emits
+        # 'hirshfeld_ratios' for the legacy model and 'a0_ratios' for the new ones.
+        ratio_key = 'hirshfeld_ratios' if self.legacy else 'a0_ratios'
+        hirshfeld_ratios = inputs.get(ratio_key)
         if hirshfeld_ratios is None:
-            hirshfeld_ratios =  self.hirshfeld_ratios(inputs)['hirshfeld_ratios']
+            hirshfeld_ratios = self.hirshfeld_ratios(inputs)[ratio_key]
+
+        if self.legacy:
+            # Legacy SO3LR has no dedicated C6 head: C6 is derived from Hirshfeld
+            # ratios (C6 scales with h^2). Feeding c6_ratios = h^2 into the shared
+            # mixing rule reproduces the original C6 = C6_free * h^2 exactly.
+            c6_ratios = hirshfeld_ratios ** 2
+        else:
+            c6_ratios = inputs.get('c6_ratios')
+            if c6_ratios is None:
+                c6_ratios = self.c6_ratios(inputs)['c6_ratios']
 
         # Get atomic numbers (needed to link to the free-atom reference values)
         atomic_numbers = inputs['atomic_numbers']  # (num_nodes)
@@ -1108,7 +1299,9 @@ class DispersionEnergySparse(nn.Module):
             atomic_numbers,
             idx_i_lr,
             idx_j_lr,
-            hirshfeld_ratios
+            hirshfeld_ratios,
+            c6_ratios,
+            legacy=self.legacy
         )
 
         # Use cubic fit for gamma

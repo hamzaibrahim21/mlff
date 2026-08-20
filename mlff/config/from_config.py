@@ -57,6 +57,9 @@ def make_so3krates_sparse_from_config(
         residual_mlp_2=model_config.residual_mlp_2,
         layer_normalization_1=model_config.layer_normalization_1,
         layer_normalization_2=model_config.layer_normalization_2,
+        use_rms_norm=model_config.get('use_rms_norm', False),
+        qk_norm=model_config.get('qk_norm', False),
+        use_residual_scalars=model_config.get('use_residual_scalars', False),
         message_normalization=config.model.message_normalization,
         avg_num_neighbors=config.data.avg_num_neighbors if config.model.message_normalization == 'avg_num_neighbors' else None,
         qk_non_linearity=model_config.qk_non_linearity,
@@ -79,6 +82,18 @@ def make_so3krates_sparse_from_config(
         dispersion_energy_scale=model_config.dispersion_energy_scale,
         return_representations_bool=return_representations_bool,
         zbl_repulsion_bool=model_config.zbl_repulsion_bool,
+        # Checkpoints trained before `legacy_so3lr_bool` existed (e.g. so3lr's own
+        # bundled v1 default) omit the key entirely. Fall back to legacy only when
+        # none of the newer-architecture flags are set either; a checkpoint with
+        # any of those set is unambiguously non-legacy even if it forgot the flag.
+        legacy_so3lr_bool=model_config.get(
+            'legacy_so3lr_bool',
+            not (
+                model_config.get('use_rms_norm', False)
+                or model_config.get('qk_norm', False)
+                or model_config.get('use_residual_scalars', False)
+            )
+        ),
         use_final_bias_bool=model_config.get('use_final_bias_bool', True),
         neighborlist_format_lr=config.neighborlist_format_lr,
         output_intermediate_quantities=output_intermediate_quantities,

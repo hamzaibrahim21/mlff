@@ -12,6 +12,23 @@ from mlff.sph_ops import make_l0_contraction_fn
 from mlff.masking import mask
 
 
+def functional_rms_norm(x: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:
+    """Functional RMSNorm without learnable parameters.
+
+    Used for QK normalization where we need to normalize intermediate tensors
+    inline without creating a module. For layer normalization, prefer using
+    nn.RMSNorm(use_scale=False) instead.
+
+    Args:
+        x: Input array of shape (..., features)
+        eps: Small constant for numerical stability
+
+    Returns:
+        Normalized array of the same shape
+    """
+    return x * jax.lax.rsqrt(jnp.mean(x ** 2, axis=-1, keepdims=True) + eps)
+
+
 def split_in_heads(x: jnp.ndarray, num_heads: int) -> (Callable, jnp.ndarray):
     def inv_split(inputs):
         return inputs.reshape(*x.shape[:-1], -1)
@@ -35,6 +52,8 @@ class SO3kratesLayerSparse(BaseSubModule):
     residual_mlp_2: bool = False
     layer_normalization_1: bool = False
     layer_normalization_2: bool = False
+    use_rms_norm: bool = False  # Use RMSNorm instead of LayerNorm (no learnable params)
+    qk_norm: bool = False  # Apply RMSNorm to Q and K in attention
     message_normalization: str = 'sqrt_num_features'
     avg_num_neighbors: float = None
     activation_fn: Callable = jax.nn.silu
@@ -92,6 +111,7 @@ class SO3kratesLayerSparse(BaseSubModule):
             activation_fn=self.activation_fn,
             normalization=self.message_normalization,
             avg_num_neighbors=self.avg_num_neighbors,
+            qk_norm=self.qk_norm,
             name='attention_block')(x=x,
                                     ev=ev,
                                     rbf_ij=rbf_ij,
@@ -105,7 +125,10 @@ class SO3kratesLayerSparse(BaseSubModule):
         ev = ev + ev_att  # (num_nodes, num_orders)
 
         if self.layer_normalization_1:
-            x = nn.LayerNorm(name='layer_normalization_1')(x)  # (num_nodes, num_features)
+            if self.use_rms_norm:
+                x = nn.RMSNorm(use_scale=False, name='layer_normalization_1')(x)  # (num_nodes, num_features)
+            else:
+                x = nn.LayerNorm(name='layer_normalization_1')(x)  # (num_nodes, num_features)
 
         if self.residual_mlp_1:
             y = self.activation_fn(x)  # (num_nodes, num_features)
@@ -146,7 +169,10 @@ class SO3kratesLayerSparse(BaseSubModule):
             x = x + y  # (num_nodes, num_features)
 
         if self.layer_normalization_2:
-            x = nn.LayerNorm(name='layer_normalization_2')(x)  # (num_nodes, num_features)
+            if self.use_rms_norm:
+                x = nn.RMSNorm(use_scale=False, name='layer_normalization_2')(x)  # (num_nodes, num_features)
+            else:
+                x = nn.LayerNorm(name='layer_normalization_2')(x)  # (num_nodes, num_features)
 
         return {'x': x, 'ev': ev}  # (num_nodes, num_features), (num_nodes, num_orders)
 
@@ -160,6 +186,8 @@ class SO3kratesLayerSparse(BaseSubModule):
                                    'residual_mlp_2': self.residual_mlp_2,
                                    'layer_normalization_1': self.layer_normalization_1,
                                    'layer_normalization_2': self.layer_normalization_2,
+                                   'use_rms_norm': self.use_rms_norm,
+                                   'qk_norm': self.qk_norm,
                                    'activation_fn': self.activation_fn,
                                    'behave_like_identity_fn_at_init': self.behave_like_identity_fn_at_init
                                    }
@@ -176,6 +204,7 @@ class AttentionBlock(nn.Module):
     activation_fn: Callable = jax.nn.silu
     output_is_zero_at_init: bool = False
     use_spherical_filter: bool = True
+    qk_norm: bool = False  # Apply RMSNorm to Q and K after projection
 
     def setup(self):
         if self.output_is_zero_at_init:
@@ -315,6 +344,13 @@ class AttentionBlock(nn.Module):
         # (num_pairs, tot_num_heads, num_features_head)
         k2_j = self.qk_non_linearity(jnp.einsum('Hij, NHj -> NHi', Wk2, x2_h))[idx_j]
         # (num_pairs, tot_num_heads, num_features_head)
+
+        # QK Normalization: stabilizes attention without need for softcap or careful scaling
+        if self.qk_norm:
+            q1_i = functional_rms_norm(q1_i)
+            k1_j = functional_rms_norm(k1_j)
+            q2_i = functional_rms_norm(q2_i)
+            k2_j = functional_rms_norm(k2_j)
 
         if self.normalization == 'identity':
             nc1 = jnp.array([1.])

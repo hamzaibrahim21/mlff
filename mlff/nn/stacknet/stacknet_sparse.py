@@ -21,6 +21,7 @@ class StackNetSparse(nn.Module):
     observables: Sequence[Callable]
     prop_keys: Dict
     return_representations_bool: bool = False
+    use_residual_scalars: bool = False  # Per-layer learnable residual scalars
 
     def setup(self):
         if len(self.feature_embeddings) == 0:
@@ -67,7 +68,28 @@ class StackNetSparse(nn.Module):
         x = jnp.stack(embeds, axis=-1).sum(axis=-1) / jnp.sqrt(len(embeds))  # shape: (n,F)
         quantities.update({'x': x})
 
+        # Per-layer residual scalars (inspired by nanochat/modded-nanogpt)
+        # resid_lambda: scales the residual stream at each layer (init 1.0 = neutral)
+        # x0_lambda: blends initial embedding back in at each layer (init 0.1 = small contribution)
+        if self.use_residual_scalars:
+            n_layers = len(self.layers)
+            resid_lambdas = self.param(
+                'resid_lambdas',
+                nn.initializers.ones,
+                (n_layers,)
+            )
+            x0_lambdas = self.param(
+                'x0_lambdas',
+                lambda key, shape: jnp.full(shape, 0.1),
+                (n_layers,)
+            )
+            x0 = x  # Save initial embedding for skip connection
+
         for (n, layer) in enumerate(self.layers):
+            if self.use_residual_scalars:
+                # Scale residual stream and blend in initial embedding
+                x_current = quantities['x']
+                quantities['x'] = resid_lambdas[n] * x_current + x0_lambdas[n] * x0
             updated_quantities = layer(**quantities)
             quantities.update(updated_quantities)
 
