@@ -16,6 +16,7 @@ def init_itp_net(
         cutoff_fn: str = 'smooth_cutoff',
         cutoff: float = 5.,
         cutoff_lr: Optional[float] = None,
+        electrostatic_cutoff_lr: Optional[float] = None,
         filter_num_layers: int = 1,
         filter_activation_fn: str = 'identity',
         mp_max_degree: int = 2,
@@ -116,7 +117,7 @@ def init_itp_net(
     electrostatic_energy = ElectrostaticEnergySparse(
         prop_keys=None,
         partial_charges=partial_charges,
-        cutoff_lr=cutoff_lr,
+        cutoff_lr=electrostatic_cutoff_lr if electrostatic_cutoff_lr is not None else cutoff_lr,
         electrostatic_energy_scale=electrostatic_energy_scale,
         neighborlist_format=neighborlist_format_lr
     )

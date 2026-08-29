@@ -28,6 +28,7 @@ def init_so3krates_sparse(
         cutoff_fn: str = 'exponential',
         cutoff: float = 5.,
         cutoff_lr: Optional[float] = None,
+        electrostatic_cutoff_lr: Optional[float] = None,
         degrees: Sequence[int] = [1, 2, 3, 4],
         residual_mlp_1: bool = True,
         residual_mlp_2: bool = True,
@@ -148,7 +149,9 @@ def init_so3krates_sparse(
     electrostatic_energy = ElectrostaticEnergySparse(
         prop_keys=None,
         partial_charges=partial_charges,
-        cutoff_lr=cutoff_lr,
+        # Electrostatics may use its own (typically shorter) long-range cutoff
+        # while dispersion and the LR neighbour list stay at ``cutoff_lr``.
+        cutoff_lr=electrostatic_cutoff_lr if electrostatic_cutoff_lr is not None else cutoff_lr,
         electrostatic_energy_scale=electrostatic_energy_scale,
         neighborlist_format=neighborlist_format_lr
     )

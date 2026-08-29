@@ -54,6 +54,14 @@ def load_model_from_workdir(
         cfg.model.cutoff_lr = cutoff_lr
         cfg.neighborlist_format_lr = neighborlist_format
 
+        # Optional: a separate long-range cutoff for electrostatics only. The LR
+        # neighbour list and dispersion keep ``cutoff_lr``; when this is set and
+        # smaller, the electrostatic module smoothly switches off pairs beyond it.
+        electrostatic_cutoff_lr = long_range_kwargs.get('electrostatic_cutoff_lr')
+        cfg.model.electrostatic_cutoff_lr = (
+            electrostatic_cutoff_lr if electrostatic_cutoff_lr is not None else cutoff_lr
+        )
+
         cfg.electrostatic_energy_kspace_do_ewald_bool = long_range_kwargs.get('coulomb_kspace_do_ewald', False)
         cfg.electrostatic_energy_kspace_interp_nodes = int(long_range_kwargs.get('coulomb_kspace_interp_nodes', 4))
 
