@@ -6,7 +6,10 @@ import jax.numpy as jnp
 import logging
 
 from jax import lax
-from jax.experimental.host_callback import id_tap
+try:
+    from jax.experimental.host_callback import id_tap
+except ImportError:  # removed in jax >= 0.4.35; this loop runs eagerly, so call directly
+    id_tap = None
 
 from typing import Dict, Tuple
 from collections import namedtuple
@@ -116,7 +119,10 @@ class SimulatorX:
             integrator = final_integrator
 
             if step % self.save_frequency == 0:
-                id_tap(self.save_trajectory, step_data)
+                if id_tap is not None:
+                    id_tap(self.save_trajectory, step_data)
+                else:
+                    self.save_trajectory(step_data, None)
 
             t = delta_t * (step + 1 - overflow_count)
             temp = step_data.observables['temperature'][-1].item()
