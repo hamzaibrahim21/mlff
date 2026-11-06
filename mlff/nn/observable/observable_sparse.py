@@ -1073,6 +1073,31 @@ class NLHRepulsionSparse(BaseSubModule):
         pass
 
 
+def segment_sum_pair_energy(
+        pair_energy: jnp.ndarray,
+        idx_i: jnp.ndarray,
+        idx_j: jnp.ndarray,
+        num_nodes: int,
+        neighborlist_format: str = 'sparse'
+) -> jnp.ndarray:
+    """Reduce per-pair long-range energies to per-atom energies, giving each atom half of every pair.
+
+    'sparse' stores every pair twice, as (i, j) and (j, i), and the pair energy already carries
+    the factor 0.5, so summing over `idx_i` hands each atom half of each of its pairs.
+    'ordered_sparse' stores every pair once with i < j and the pair energy carries the factor 1.0.
+    Summing over `idx_i` alone would assign the whole pair to the lower-indexed atom, so the pair
+    is split explicitly here. Both formats give the same per-atom energies and the same total.
+    Padded edges carry out-of-range indices and are dropped by `segment_sum`.
+    """
+    if neighborlist_format == 'ordered_sparse':
+        half = pair_energy * jnp.asarray(0.5, dtype=pair_energy.dtype)
+        return (
+            segment_sum(half, segment_ids=idx_i, num_segments=num_nodes)
+            + segment_sum(half, segment_ids=idx_j, num_segments=num_nodes)
+        )
+    return segment_sum(pair_energy, segment_ids=idx_i, num_segments=num_nodes)
+
+
 class ElectrostaticEnergySparse(BaseSubModule):
     prop_keys: Dict
     partial_charges: Any
@@ -1170,10 +1195,12 @@ class ElectrostaticEnergySparse(BaseSubModule):
             )            
 
         # Calculate electrostatic atomic energies via summing over long-range neighbors
-        atomic_electrostatic_energy = segment_sum(
+        atomic_electrostatic_energy = segment_sum_pair_energy(
             atomic_electrostatic_energy_ij,
-            segment_ids=idx_i_lr,
-            num_segments=num_nodes
+            idx_i_lr,
+            idx_j_lr,
+            num_nodes,
+            self.neighborlist_format
         )  # (num_nodes)
 
         # Mask padded nodes
@@ -1344,10 +1371,12 @@ class DispersionEnergySparse(nn.Module):
 
             dispersion_energy_ij = safe_scale(dispersion_energy_ij, w, 0.)
 
-        atomic_dispersion_energy = segment_sum(
+        atomic_dispersion_energy = segment_sum_pair_energy(
             dispersion_energy_ij,
-            segment_ids=idx_i_lr,
-            num_segments=num_nodes
+            idx_i_lr,
+            idx_j_lr,
+            num_nodes,
+            self.neighborlist_format
         )  # (num_nodes)
 
         atomic_dispersion_energy = safe_scale(atomic_dispersion_energy, node_mask)
